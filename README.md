@@ -1,188 +1,190 @@
-# voice-typer
+# VoiceTyper
 
-Локальный push-to-talk voice-to-text для macOS. Аналог VibeTyper, но бесплатный,
-полностью офлайн и без подписок. Зажимаешь **Fn**, говоришь, отпускаешь — текст
-распознаётся локальной моделью Whisper (через `mlx-whisper`, ускоренную под
-Apple Silicon) и вставляется в то окно, где сейчас курсор.
+[![CI](https://github.com/triumphpc/voice-typer/actions/workflows/ci.yml/badge.svg)](https://github.com/triumphpc/voice-typer/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2FM2%2FM3%2FM4-orange)
+![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
 
-Никакие аудио или текст никуда не отправляются — всё считается на твоём Mac.
+**Push-to-talk voice typing for macOS — fully offline.**
 
-## Установка
+Hold **Fn**, speak, release. Your words are transcribed by a local Whisper
+model ([mlx-whisper](https://github.com/ml-explore/mlx-examples), accelerated
+on Apple Silicon) and pasted into whatever text field has focus.
 
-```bash
-cd ~/Devel/tools/voice-typer && ./build_app.sh
+No cloud, no subscriptions, no telemetry. Audio and text never leave your Mac.
+
+*Документация на русском: [README.ru.md](README.ru.md).*
+
+## Features
+
+- 🎙 **Push-to-talk** — hold the Fn key anywhere, in any app
+- 🔒 **100% offline** — transcription runs locally via Whisper on MLX;
+  after the first model download the app never touches the network
+- ⚡️ **Fast** — ~0.5 s to transcribe a typical phrase on an M-series chip
+- 📊 **Live HUD** — a small floating panel shows the microphone level while
+  recording and a "thinking" indicator while transcribing; no beeps,
+  meeting-friendly
+- 🍏 **Native menu bar app** — status icon, log access, quit; no Dock icon
+- 🛡 **Self-healing** — watchdogs recover from macOS disabling the event tap,
+  audio-device changes, sleep/wake, and wedged CoreAudio calls
+- 🌍 **Any Whisper language** — defaults to Russian, one line to change
+
+## How it works
+
+```
+   hold Fn                release Fn
+      │                       │
+      ▼                       ▼
+┌───────────┐   audio   ┌───────────┐   text   ┌──────────────┐
+│ CGEventTap│──────────▶│  Whisper  │─────────▶│ clipboard +  │
+│ (hotkey)  │  PortAudio│ (MLX, GPU)│          │ synthetic ⌘V │
+└───────────┘           └───────────┘          └──────────────┘
 ```
 
-Собирает `/Applications/VoiceTyper.app`. Дальше — обычное приложение: двойной
-клик в Finder, Launchpad или Spotlight. Иконки в Dock нет: приложение живёт
-в строке меню, иконкой микрофона. Через это меню — статус, лог и выход.
+Everything runs in a single menu bar app. The hotkey is captured with a Quartz
+`CGEventTap` (Fn is a modifier flag, ordinary hotkey libraries can't see it),
+audio is recorded with PortAudio, transcription runs on the GPU via MLX, and
+the result is pasted with a synthetic Cmd+V keystroke sent by physical keycode
+— so it works regardless of the active keyboard layout.
 
-Чтобы запускался сам — **Системные настройки → Основные → Объекты входа**,
-добавь туда VoiceTyper.
+## Requirements
 
-Бандл ссылается на этот каталог проекта, а не копирует его: правки в
-`voice_typer.py` подхватываются следующим запуском, пересобирать не нужно.
-Если каталог переедет — приложение честно скажет об этом при запуске,
-надо будет пересобрать.
+- macOS 13+ on Apple Silicon (M1 or newer) — MLX requires it
+- [python.org framework build of Python 3.13](https://www.python.org/downloads/macos/)
+  (`/Library/Frameworks/Python.framework`) — the app embeds this interpreter
+- ~1.6 GB of disk for the default Whisper model (downloaded once on first run)
 
-## Права доступа
-
-При первом запуске macOS попросит доступ. **Системные настройки →
-Конфиденциальность и безопасность**:
-
-- **Микрофон** — для записи голоса
-- **Мониторинг ввода** — чтобы ловить Fn глобально
-- **Универсальный доступ** — чтобы вставлять текст через Cmd+V
-
-Права привязаны к **приложению**, а не к Python: то, что раньше было выдано
-терминалу, приложению не наследуется — их придётся выдать заново, один раз.
-
-Ещё стоит зайти в **Системные настройки → Клавиатура → «Нажатие клавиши Fn»**
-и выбрать **«Ничего не делать»** — иначе Fn будет параллельно открывать
-эмодзи-панель или системную диктовку.
-
-## Использование
-
-1. Поставь курсор в любое поле ввода
-2. Зажми **Fn**, скажи фразу, отпусти
-3. Текст появится в поле
-
-Пока идёт запись, над строкой меню всплывает узкая панель с бегущей дорожкой
-уровня микрофона — видно, что голос действительно пишется и что он вообще
-доходит. После отпускания Fn дорожка сменяется пульсирующими точками
-(идёт распознавание), потом панель исчезает сама. Звуков нет: панель нагляднее
-и не мешает в наушниках или на созвоне.
-
-Иконка в строке меню дублирует состояние: микрофон — готов, закрашенный
-микрофон — пишет, волна — распознаёт, треугольник — нет прав или микрофона.
-Первый пункт меню повторяет то же словами.
-
-**Выход:** меню в строке меню → «Выйти». Если приложение впереди — работает
-и ⌘Q.
-
-Если вставка не сработала — текст всё равно остаётся в буфере обмена,
-можно вставить руками через Cmd+V.
-
-## Если что-то не так
-
-Лог: `~/Library/Logs/VoiceTyper.log` (или пункт «Показать лог» в меню).
-Там видно каждый шаг: старт записи, длительность, время распознавания,
-результат, проблемы с правами и перехватом.
-
-Отладочный запуск в терминале, с выводом в консоль:
+## Installation
 
 ```bash
-cd ~/Devel/tools/voice-typer && ./run.sh
+git clone https://github.com/triumphpc/voice-typer.git
+cd voice-typer
+make install
 ```
 
-Одновременно работает только одна копия — консольная не поднимется, пока
-запущено приложение (иначе обе ловили бы Fn и вставляли текст дважды).
+This builds `/Applications/VoiceTyper.app`. Launch it like any app — Finder,
+Launchpad, or Spotlight. To start it automatically, add VoiceTyper to
+**System Settings → General → Login Items**.
 
-Если приложение зависло (иконка есть, а реакции нет) — сними стеки всех
-потоков, там сразу видно, где именно оно стоит:
+> The bundle references this project directory rather than copying it:
+> edits to `voice_typer.py` take effect on the next launch, no rebuild needed.
+> If you move the directory, rebuild with `make install`.
+
+### Permissions
+
+On first launch macOS will ask for access. In **System Settings →
+Privacy & Security**, grant:
+
+| Permission | Why |
+|---|---|
+| **Microphone** | record your voice |
+| **Input Monitoring** | detect the Fn key globally |
+| **Accessibility** | paste text via Cmd+V |
+
+Permissions are granted to the **app bundle**, not to Python — anything you
+previously granted to your terminal does not carry over. This is also why the
+launcher embeds the interpreter into the app binary instead of `exec`-ing
+`python3`: macOS ties permissions to the executable image, and a naive
+launcher silently loses them.
+
+Also set **System Settings → Keyboard → "Press Fn key to" → Do Nothing**,
+otherwise Fn will simultaneously open the emoji picker or system dictation.
+
+## Usage
+
+1. Put the cursor in any text field
+2. Hold **Fn**, say a phrase, release
+3. The text appears
+
+While recording, a floating panel above the Dock shows the live microphone
+level; after you release Fn it switches to pulsing dots while Whisper works,
+then hides. The menu bar icon mirrors the state: mic — ready, filled mic —
+recording, waveform — transcribing, warning triangle — missing permissions.
+
+If pasting fails, the text is still on the clipboard — press Cmd+V manually.
+
+## Configuration
+
+All settings are constants at the top of [`voice_typer.py`](voice_typer.py):
+
+| Setting | Default | Description |
+|---|---|---|
+| `MODEL` | `whisper-large-v3-turbo` | Whisper model; `small`/`base` are faster but less accurate |
+| `LANGUAGE` | `"ru"` | fixed language (faster, more accurate); `None` = auto-detect |
+| `MIN_RECORDING_SECONDS` | `0.4` | recordings shorter than this are discarded |
+| `MAX_RECORDING_SECONDS` | `120` | safety cap in case an Fn release event is lost |
+| `SHOW_HUD` / `HUD_BARS` | `True` / `27` | the floating level panel |
+| `SOUND_FEEDBACK` | `False` | start/stop sounds (off — the HUD replaces them) |
+| `SHOW_IN_DOCK` | `False` | show a Dock icon and appear in ⌘-Tab |
+| `HALLUCINATIONS` | — | phrases Whisper invents on silence, filtered out |
+
+## Troubleshooting
+
+**Log:** `~/Library/Logs/VoiceTyper.log` (or "Show log" in the menu). Every
+step is logged: recording start, duration, transcription time, result,
+permission and event-tap issues.
+
+**Debug run** in a terminal with console output:
+
+```bash
+make run
+```
+
+Only one instance runs at a time — the console copy won't start while the app
+is running (otherwise both would capture Fn and paste twice).
+
+**If the app hangs** (icon present, no reaction) — dump all thread stacks and
+see exactly where it is stuck:
 
 ```bash
 kill -USR1 $(pgrep -f VoiceTyper.app)
 cat ~/Library/Logs/VoiceTyper.threads.log
 ```
 
-Модель обновляется вручную — приложение намеренно не сверяется с huggingface
-(см. «Устройство»). Чтобы подтянуть новую версию, удали её из кэша
-`~/.cache/huggingface/hub/models--mlx-community--*` и запусти при живой сети.
+**Model updates** are manual by design — the app deliberately never checks
+huggingface.co for new revisions (an offline tool must not block on the
+network). To update, delete the model from
+`~/.cache/huggingface/hub/models--mlx-community--*` and launch with network
+access.
 
-## Настройки
+## Design notes
 
-Всё в начале `voice_typer.py`:
+The app is built around one observation: on macOS, every failure mode of a
+background utility tends to be **silent**. Each of these was hit in practice
+and is now handled:
 
-- `MODEL` — модель Whisper. `large-v3-turbo` точнее, но чуть медленнее;
-  `small` / `base` — быстрее, но заметно хуже с русским
-- `LANGUAGE` — `"ru"` фиксирует русский (быстрее и точнее); `None` — автоопределение
-- `MIN_RECORDING_SECONDS` — короче этого записи отбрасываются
-- `MAX_RECORDING_SECONDS` — предохранитель от «залипшей» Fn
-- `SHOW_HUD` / `HUD_BARS` — панель с уровнем звука и число полосок в ней
-- `SOUND_FEEDBACK` — звуки начала и конца записи; по умолчанию выключены,
-  вместо них панель
-- `SHOW_IN_DOCK` — показывать иконку в Dock. По умолчанию выключено: место
-  такой утилиты — строка меню, а Dock-иконка ещё и забирает фокус при запуске.
-  Включи, если хочешь закрывать приложение правым кликом по Dock и видеть его
-  в ⌘-Tab
-- `HALLUCINATIONS` — фразы, которые Whisper выдумывает на тишине
-  («Продолжение следует...», «Спасибо за просмотр») — отсекаются перед вставкой
+- **Network stalls.** `mlx_whisper` calls `snapshot_download` on every model
+  load, which pings huggingface.co *without a timeout*. On a flaky network
+  (VPN, captive portal) transcription silently blocked for over a minute.
+  Now, if the model is cached, `HF_HUB_OFFLINE=1` is set before import and
+  the network is never used.
+- **Event tap death.** macOS disables event taps (handler timeout, sleep/wake,
+  session switch) and the notification often never arrives. A watchdog thread
+  polls the tap every 2 s and re-enables or re-creates it.
+- **Wedged CoreAudio.** `Pa_StopStream` can block forever after an
+  audio-device change or wake from sleep. Every PortAudio call runs in a
+  helper thread with a timeout; a wedged stream is abandoned (its captured
+  audio is still transcribed) and PortAudio is re-initialised.
+- **Layout-proof pasting.** Cmd+V is posted by physical keycode
+  (`kVK_ANSI_V`), not by character — AppleScript's `keystroke "v"` looks the
+  key up in the *current* layout and silently does nothing on non-Latin
+  layouts.
+- **No external binaries.** Audio is passed to the model as an in-memory
+  array, not a temp `.wav` — apps launched from Finder don't have Homebrew's
+  `ffmpeg` in `PATH`.
 
-Хоткей захардкожен на **Fn** (`Quartz.kCGEventFlagMaskSecondaryFn`): Fn — это
-флаг-модификатор, а не обычная клавиша, поэтому ловится напрямую через
-`CGEventTap`, а не библиотекой вроде `pynput`.
+Worker-thread crashes are logged via `threading.excepthook`, the transcription
+thread survives errors and retries on the next phrase, and the menu bar icon
+always reflects the real state.
 
-## Устройство
+## Known limitations
 
-**Почему приложение, а не просто скрипт.** Права (микрофон, мониторинг ввода,
-универсальный доступ) macOS выдаёт конкретному исполняемому файлу. Наивный
-лаунчер, который делает `exec` на `python3`, подменяет образ процесса — и права
-уезжают на «Python», а приложение остаётся ни с чем, причём молча: галочка
-в настройках стоит, а Fn не ловится. Поэтому `launcher.c` **встраивает**
-интерпретатор в бинарник приложения (`Py_InitializeFromConfig` + `Py_RunMain`),
-без порождения отдельного процесса, а бандл подписывается ad-hoc с фиксированным
-`CFBundleIdentifier` — чтобы у прав была стабильная точка привязки.
+- macOS on Apple Silicon only (MLX + Accessibility APIs)
+- Pasting goes through the clipboard, overwriting its previous contents
+- On very quiet or short recordings Whisper occasionally hallucinates text —
+  common cases are filtered, the rest is one Cmd+Z away
 
-**Почему переставало работать со временем.** Четыре независимые причины,
-все закрыты:
+## License
 
-- **Главная: приложение ходило в сеть за моделью.** `mlx_whisper` при каждой
-  загрузке модели зовёт `snapshot_download`, а тот — `repo_info` к
-  huggingface.co, **без таймаута**: сверяет, не появилась ли новая ревизия.
-  Модель при этом давно лежит в кэше и никуда не девается. Стоит сети
-  пропасть или начать молча дропать пакеты (VPN, чужой Wi-Fi, captive portal) —
-  и распознавание встаёт на TCP-коннекте до системного таймаута, больше минуты,
-  без единого сообщения: запись идёт, индикация отрабатывает, текст не появляется.
-  Теперь, если модель есть в кэше, `HF_HUB_OFFLINE=1` выставляется **до**
-  импорта (huggingface_hub читает эту переменную один раз, при импорте) —
-  и сеть не используется вообще.
-- macOS отключает event tap (таймаут обработчика, выход из сна, смена сессии),
-  а уведомление об этом до приложения не доходит — обработчик к тому моменту
-  уже не вызывается. Поэтому состояние **опрашивается** сторожевым потоком
-  раз в 2 секунды и перехват поднимается обратно, вплоть до пересоздания.
-- Старт и стоп записи шли из обработчика хоткея под общим мьютексом. Любой
-  подвисший вызов PortAudio (смена аудиоустройства, выход из сна) оставлял
-  мьютекс захваченным навсегда: процесс жив, а хоткей больше ничего не делает.
-  Теперь запись живёт в отдельном потоке и управляется очередью команд —
-  блокировок нет вовсе.
-- PortAudio держит снимок аудиоустройств с момента инициализации; после смены
-  устройства открытие потока падало раз за разом. Теперь при ошибке он
-  переинициализируется и пробует снова.
-- **Приложению не хватало `ffmpeg`.** `mlx_whisper`, получив путь к файлу,
-  читает его внешним `ffmpeg`. Из терминала всё работало (`/opt/homebrew/bin`
-  в `PATH`), а запущенное из Finder приложение получает голый
-  `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — и распознавание падало на
-  `FileNotFoundError: 'ffmpeg'`. Причём выглядело это как «звук читает,
-  но не вставляет»: запись шла, панель отрабатывала, текста не было.
-  Теперь звук передаётся в модель массивом в памяти, а не файлом:
-  внешний бинарник не нужен вовсе, заодно исчезли временные `.wav`.
-
-Общая черта у всех четырёх — отказ был **молчаливым**. Поэтому теперь падение
-любого рабочего потока логируется (`threading.excepthook`), поток распознавания
-переживает ошибку и пробует снова на следующей фразе, а состояние видно
-по иконке в строке меню.
-
-Плюс мелочи того же рода: потерянное отпускание Fn больше не оставляет запись
-включённой навсегда (`MAX_RECORDING_SECONDS`), временных `.wav` больше нет
-вообще (раньше копились в `/tmp`), лог ротируется, две копии сразу не запустятся.
-
-**Остальное:**
-
-- Обработчик событий клавиатуры делает минимум работы (только кладёт команду
-  в очередь) — если он тормозит, macOS молча отключает перехват.
-- Вставка идёт нативно через `CGEventPost` физическим кодом клавиши V
-  (`kVK_ANSI_V = 9`), а не символом. AppleScript-вариант `keystroke "v"` ищет
-  клавишу по символу в **текущей раскладке**: при русской раскладке символа `v`
-  в ней нет, нажатие уходит в никуда, а `osascript` при этом рапортует успех —
-  текст «распознан и вставлен», но в поле ничего не появляется.
-
-## Известные ограничения
-
-- Только macOS на Apple Silicon (MLX + Accessibility API)
-- Нужен python.org framework build 3.13 (`/Library/Frameworks/Python.framework`) —
-  из него берётся встраиваемый интерпретатор
-- Вставка идёт через буфер обмена — распознанный текст перезаписывает то,
-  что было в буфере
-- На очень тихих или коротких записях Whisper иногда выдумывает текст —
-  частые случаи отфильтрованы, остальное лечится `Cmd+Z`
+[MIT](LICENSE)

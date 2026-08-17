@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Syntax check
+        run: python -m py_compile voice_typer.py make_icon.py
+      - name: Compile launcher
+        run: |
+          clang -fsyntax-only -Wall -Wextra \
+            -I"$(python3 -c 'import sysconfig; print(sysconfig.get_path("include"))')" \
+            -DVT_PROGRAM_NAME='"python3"' \
+            -DVT_SCRIPT='"voice_typer.py"' \
+            -DVT_SITE_PACKAGES='"site-packages"' \
+            launcher.c

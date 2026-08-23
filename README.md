@@ -44,7 +44,9 @@ No cloud, no subscriptions, no telemetry. Audio and text never leave your Mac.
 
 Everything runs in a single menu bar app. The hotkey is captured with a Quartz
 `CGEventTap` (Fn is a modifier flag, ordinary hotkey libraries can't see it),
-audio is recorded with PortAudio, transcription runs on the GPU via MLX, and
+audio is recorded with PortAudio in a dedicated helper process (so a wedged
+CoreAudio call can be killed and respawned), transcription runs on the GPU via
+MLX, and
 the result is pasted with a synthetic Cmd+V keystroke sent by physical keycode
 — so it works regardless of the active keyboard layout.
 
@@ -163,9 +165,14 @@ and is now handled:
   session switch) and the notification often never arrives. A watchdog thread
   polls the tap every 2 s and re-enables or re-creates it.
 - **Wedged CoreAudio.** `Pa_StopStream` can block forever after an
-  audio-device change or wake from sleep. Every PortAudio call runs in a
-  helper thread with a timeout; a wedged stream is abandoned (its captured
-  audio is still transcribed) and PortAudio is re-initialised.
+  audio-device change or wake from sleep — and the wedge is process-global:
+  once one call is stuck, every later `Pa_OpenStream`/`Pa_Terminate` hangs
+  too, so no in-process timeout can recover (tried; it ended in a permanent
+  "microphone unavailable"). Audio capture therefore lives in a separate
+  helper process (`audio_helper.py`): commands go over stdin/stdout with a
+  timeout, frames are written unbuffered to a file, and a wedged helper is
+  simply killed and respawned — everything captured before the hang is
+  still transcribed.
 - **Layout-proof pasting.** Cmd+V is posted by physical keycode
   (`kVK_ANSI_V`), not by character — AppleScript's `keystroke "v"` looks the
   key up in the *current* layout and silently does nothing on non-Latin

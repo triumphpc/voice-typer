@@ -26,7 +26,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
 
 import AppKit
 import Foundation
@@ -66,10 +65,11 @@ MAX_RECORDING_SECONDS = 120.0
 # Как часто сторож проверяет, что перехват событий ещё жив.
 TAP_CHECK_INTERVAL = 2.0
 
-# Потолок на любой вызов PortAudio (открытие/остановка потока, переинициализация).
-# Pa_StopStream после смены аудиоустройства или выхода из сна может заблокироваться
-# в CoreAudio навсегда - без таймаута зависает весь аудио-поток, и хоткей умирает.
-PORTAUDIO_OP_TIMEOUT = 5.0
+# Потолок на команду аудио-хелперу (старт/стоп записи, запуск процесса).
+# PortAudio в хелпере после смены аудиоустройства или выхода из сна может
+# заблокироваться в CoreAudio навсегда - по этому таймауту хелпер убивается
+# и поднимается заново.
+HELPER_OP_TIMEOUT = 5.0
 
 # Индикация записи. Панель с уровнем звука нагляднее звуков и не мешает,
 # когда пишешь в наушниках или на созвоне.
@@ -461,167 +461,212 @@ def _notify(message: str) -> None:
 # ---------------------------------------------------------------------------
 # Запись звука
 #
-# Запуск и остановка потока PortAudio идут в одном выделенном треде, командами
-# через очередь. Раньше это делалось прямо из обработчика хоткея под общим
-# мьютексом - и любой залипший вызов PortAudio (смена аудиоустройства, выход из
-# сна) оставлял мьютекс захваченным навсегда: процесс жив, а хоткей больше
-# ничего не делает. Очередь такого класса отказов не допускает.
+# Захват микрофона живёт в отдельном процессе (audio_helper.py). PortAudio
+# после смены аудиоустройства или выхода из сна может навсегда завесить любой
+# вызов в CoreAudio, причём клин процесс-глобальный: первый зависший
+# Pa_StopStream делает нерабочими и все последующие Pa_OpenStream/Pa_Terminate.
+# Внутри одного процесса это не лечится (проверено: watchdog с бросанием
+# зависшего потока по таймауту доводил до перманентного "microphone
+# unavailable" - все последующие вызовы вставали на том же клине).
+# Отдельный процесс по таймауту просто убивается и поднимается заново, а всё
+# записанное до клина остаётся в файле и уходит на распознавание.
 # ---------------------------------------------------------------------------
+
+HELPER_PATH = Path(__file__).resolve().with_name("audio_helper.py")
 
 _audio_cmd: "queue.Queue[str]" = queue.Queue()
 _transcribe_q: "queue.Queue[np.ndarray | None]" = queue.Queue()
 
 
-def _pa_call(fn, name: str):
-    """Выполняет вызов PortAudio в отдельном потоке с таймаутом.
+class AudioHelper:
+    """Клиент процесса записи: спавн, команды с таймаутом, kill при клине.
 
-    Любой вызов PortAudio (Pa_StopStream, Pa_OpenStream, Pa_Terminate) может
-    заблокироваться в CoreAudio навсегда после смены устройства или сна.
-    Если это случится в аудио-потоке напрямую - очередь команд встанет, и
-    приложение перестанет реагировать на Fn при живом процессе (наблюдалось
-    вживую: стек показывал вечный Pa_StopStream). По таймауту зависший вызов
-    бросаем: его поток остаётся висеть в C-коде (утечка одного потока), зато
-    аудио-воркер продолжает работать.
+    Протокол описан в audio_helper.py. Очередь ответов создаётся заново на
+    каждый спавн и передаётся читающему потоку - ответы старого, убитого
+    хелпера не могут попасть новому.
     """
-    result: dict = {}
-    done = threading.Event()
 
-    def run():
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._replies: "queue.Queue[str]" = queue.Queue()
+        self._lock = threading.Lock()  # спавн/kill из разных потоков
+
+    def ensure_running(self) -> None:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return
+            replies: "queue.Queue[str]" = queue.Queue()
+            proc = subprocess.Popen(
+                [sys.executable, str(HELPER_PATH)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+            )
+            threading.Thread(
+                target=self._reader,
+                args=(proc, replies),
+                name="helper-reader",
+                daemon=True,
+            ).start()
+            # READY ждём до публикации процесса и строго под локом: параллельный
+            # вызов не должен увидеть хелпер, который ещё не готов к командам.
+            try:
+                reply = replies.get(timeout=HELPER_OP_TIMEOUT)
+            except queue.Empty:
+                proc.kill()
+                raise TimeoutError(f"хелпер молчит на старте (> {HELPER_OP_TIMEOUT:.0f}s)")
+            if reply != "READY":
+                proc.kill()
+                raise RuntimeError(f"хелпер не поднялся: {reply!r}")
+            self._proc, self._replies = proc, replies
+            log.info("audio helper started (pid %d)", proc.pid)
+
+    def kill(self) -> None:
+        with self._lock:
+            proc, self._proc = self._proc, None
+        if proc is None:
+            return
         try:
-            result["value"] = fn()
-        except Exception as exc:  # noqa: BLE001 - пробрасываем вызывающему
-            result["error"] = exc
-        finally:
-            done.set()
+            proc.kill()
+            proc.wait(timeout=2)
+            log.info("audio helper killed (pid %d)", proc.pid)
+        except Exception as exc:
+            log.warning("не смог убить аудио-хелпер: %s", exc)
 
-    threading.Thread(target=run, name=name, daemon=True).start()
-    if not done.wait(PORTAUDIO_OP_TIMEOUT):
-        raise TimeoutError(f"{name} завис (> {PORTAUDIO_OP_TIMEOUT:.0f}s)")
-    if "error" in result:
-        raise result["error"]
-    return result.get("value")
+    def start(self, path: Path) -> None:
+        self.ensure_running()
+        self._send(f"START {path}")
+        reply = self._wait_reply()
+        if reply != "STARTED":
+            raise RuntimeError(reply)
 
+    def stop(self) -> None:
+        self._send("STOP")
+        reply = self._wait_reply()
+        if not reply.startswith("STOPPED"):
+            raise RuntimeError(reply)
 
-def _make_audio_callback(frames: list):
-    """Колбэк с собственным буфером кадров.
+    # -- внутренности -------------------------------------------------------
 
-    Буфер обязан принадлежать конкретному потоку записи: если stop() завис и
-    стрим брошен, его колбэк может продолжать дёргаться - и с общим глобальным
-    буфером он подмешивал бы старый звук в следующую запись.
-    """
+    def _send(self, line: str) -> None:
+        with self._lock:
+            proc = self._proc
+        if proc is None or proc.poll() is not None:
+            raise RuntimeError("аудио-хелпер не запущен")
+        proc.stdin.write(line + "\n")
+        proc.stdin.flush()
 
-    def callback(indata, frame_count, time_info, status):
+    def _wait_reply(self) -> str:
+        replies = self._replies
+        try:
+            reply = replies.get(timeout=HELPER_OP_TIMEOUT)
+        except queue.Empty:
+            raise TimeoutError(f"хелпер молчит (> {HELPER_OP_TIMEOUT:.0f}s)")
+        if reply.startswith("ERR"):
+            raise RuntimeError(reply.partition(" ")[2] or "ошибка хелпера")
+        return reply
+
+    @staticmethod
+    def _reader(proc: subprocess.Popen, replies: "queue.Queue[str]") -> None:
+        """Читает stdout хелпера: LEVEL уходит в HUD, остальное - в ответы."""
         global _level
-        if status:
-            log.debug("audio status: %s", status)
-        frames.append(indata.copy())
-
-        # Уровень для панели. Считается здесь же, потому что это единственное
-        # место, где звук вообще есть; стоит копейки и не задерживает PortAudio.
-        peak = float(np.abs(indata).max()) / 32768.0
-        _level = max(peak * 1.6, _level * 0.55)  # быстрый подъём, плавный спад
-
-    return callback
-
-
-def _reset_portaudio() -> None:
-    """PortAudio держит снимок аудиоустройств с момента инициализации.
-
-    После смены устройства (наушники, док, выход из сна) старый снимок
-    протухает и открытие потока падает раз за разом. Переинициализация
-    заставляет его перечитать устройства.
-    """
-    try:
-        _pa_call(lambda: (sd._terminate(), sd._initialize()), "pa-reset")
-        log.info("portaudio re-initialised")
-    except Exception as exc:
-        log.warning("portaudio re-init failed: %s", exc)
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("LEVEL "):
+                try:
+                    peak = float(line[6:])
+                except ValueError:
+                    continue
+                # Быстрый подъём, плавный спад - как в старом аудио-колбэке.
+                _level = max(peak * 1.6, _level * 0.55)
+            else:
+                replies.put(line)
 
 
-def _open_stream():
-    frames: list = []
-
-    def do_open():
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-            callback=_make_audio_callback(frames),
-        )
-        stream.start()
-        return stream
-
-    return _pa_call(do_open, "pa-open"), frames
+_helper = AudioHelper()
 
 
-def _close_stream(stream) -> None:
-    def do_close():
-        stream.stop()
-        stream.close()
-
-    try:
-        _pa_call(do_close, "pa-close")
-    except TimeoutError as exc:
-        # Стрим бросаем как есть: его поток завис в CoreAudio. Уже записанные
-        # кадры при этом целы - их можно распознавать.
-        log.error("остановка записи зависла, бросаю аудиопоток: %s", exc)
-    except Exception as exc:
-        log.warning("error while closing stream: %s", exc)
-        _reset_portaudio()
+def _record_path() -> Path:
+    return Path(tempfile.gettempdir()) / f"voice-typer-{os.getpid()}-{time.monotonic_ns()}.raw"
 
 
 def _audio_worker() -> None:
-    stream = None
-    frames: list = []
+    recording: Path | None = None
     started_at = 0.0
+
+    # Тёплый старт: процесс поднимается заранее, а не на первом нажатии Fn -
+    # иначе к задержке старта записи добавился бы спавн питона (~полсекунды).
+    try:
+        _helper.ensure_running()
+    except Exception as exc:
+        log.warning("audio helper warm start failed: %s", exc)
 
     while True:
         try:
             cmd = _audio_cmd.get(timeout=0.5)
         except queue.Empty:
-            if stream is not None and time.time() - started_at > MAX_RECORDING_SECONDS:
+            if recording is not None and time.time() - started_at > MAX_RECORDING_SECONDS:
                 log.warning("recording exceeded %.0fs, force stop", MAX_RECORDING_SECONDS)
                 cmd = "stop"
             else:
                 continue
 
         if cmd == "start":
-            if stream is not None:
+            if recording is not None:
                 continue
+            path = _record_path()
             try:
-                stream, frames = _open_stream()
+                _helper.start(path)
             except Exception as exc:
-                log.warning("cannot open microphone: %s - retrying after reset", exc)
-                _reset_portaudio()
+                log.warning("cannot start recording: %s - перезапускаю хелпер", exc)
+                _helper.kill()
                 try:
-                    stream, frames = _open_stream()
+                    _helper.start(path)
                 except Exception as exc2:
-                    stream = None
                     log.error("microphone unavailable: %s", exc2)
+                    path.unlink(missing_ok=True)
                     set_status(BROKEN, "нет доступа к микрофону")
                     _notify("Нет доступа к микрофону - проверь настройки приватности")
                     continue
+            recording = path
             started_at = time.time()
             set_status(RECORDING, "запись…")
             _play_sound("Pop")
             log.info("recording started")
 
         elif cmd == "stop":
-            if stream is None:
+            if recording is None:
                 continue
-            _close_stream(stream)
-            stream = None
-
-            captured, frames = frames, []
+            try:
+                _helper.stop()
+            except Exception as exc:
+                # Хелпер завис в CoreAudio. Убиваем его и поднимаем новый в
+                # фоне; всё записанное до клина уже лежит в файле.
+                log.error("остановка записи зависла (%s) - убиваю аудио-хелпер", exc)
+                _helper.kill()
+                threading.Thread(
+                    target=_respawn_helper, name="helper-respawn", daemon=True
+                ).start()
+            path, recording = recording, None
             _play_sound("Tink")
 
-            if not captured:
+            try:
+                audio = np.fromfile(path, dtype=np.int16)
+            except Exception as exc:
+                log.error("не смог прочитать записанный звук: %s", exc)
+                set_status(IDLE, "готов")
+                continue
+            finally:
+                path.unlink(missing_ok=True)
+
+            if audio.size == 0:
                 log.info("no audio captured")
                 set_status(IDLE, "готов")
                 continue
 
-            audio = np.concatenate(captured, axis=0)
-            duration = len(audio) / SAMPLE_RATE
+            duration = audio.size / SAMPLE_RATE
             if duration < MIN_RECORDING_SECONDS:
                 log.info("recording too short (%.2fs), skipping", duration)
                 set_status(IDLE, "готов")
@@ -632,6 +677,13 @@ def _audio_worker() -> None:
             # схлопывается и снова появляется.
             set_status(WORKING, "распознаю…")
             _transcribe_q.put(audio)
+
+
+def _respawn_helper() -> None:
+    try:
+        _helper.ensure_running()
+    except Exception as exc:
+        log.warning("не смог поднять аудио-хелпер: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -728,10 +780,9 @@ def _transcribe_and_paste(mlx_whisper, audio: np.ndarray) -> None:
     # ни внешних бинарников, ни файлов в /tmp. Формат тот же, что ждёт whisper:
     # моно, 16 кГц, float32 в диапазоне [-1, 1].
     #
-    # reshape обязателен: sounddevice отдаёт кадры как (N, каналы), то есть
-    # (N, 1) даже для моно. Раньше форму выпрямляла запись в wav; если отдать
-    # двумерный массив как есть, mlx падает на подсчёте окон БПФ
-    # ("Shape dimension ... outside the supported range").
+    # reshape(-1) оставлен защитой на случай формы (N, 1): сейчас звук приходит
+    # одномерным из raw-файла хелпера, но mlx падает на двумерном массиве
+    # ("Shape dimension ... outside the supported range"), а страховка бесплатна.
     samples = audio.reshape(-1).astype(np.float32) / 32768.0
 
     t0 = time.time()

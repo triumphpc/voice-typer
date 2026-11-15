@@ -12,7 +12,8 @@ Hold **Fn**, speak, release. Your words are transcribed by a local Whisper
 model ([mlx-whisper](https://github.com/ml-explore/mlx-examples), accelerated
 on Apple Silicon) and pasted into whatever text field has focus.
 
-No cloud, no subscriptions, no telemetry. Audio and text never leave your Mac.
+No cloud, no subscriptions, no telemetry. Audio and text never leave your Mac
+(except in the opt-in Jarvis mode, which talks to Claude).
 
 *Документация на русском: [README.ru.md](README.ru.md).*
 
@@ -31,6 +32,8 @@ No cloud, no subscriptions, no telemetry. Audio and text never leave your Mac.
 - 🌍 **Any Whisper language** — defaults to Russian, one line to change
 - 🔊 **Read selection aloud** — select text anywhere, press **⌃S**, and a
   local Silero voice reads it; press again to stop
+- ✨ **Jarvis mode** — press **⌃J** and just talk: hands-free questions to
+  Claude, answers spoken aloud
 
 ## How it works
 
@@ -129,6 +132,29 @@ the menu status says so. Fn keeps working.
 
 The Silero model (`v5_6_ru`, ~150 MB) is downloaded once on first launch to
 `~/.cache/voice-typer/`; after that no network is used.
+
+### Jarvis mode
+
+**⌃J** turns on a hands-free voice assistant. The microphone listens on its
+own, detects the end of a phrase by the pause, transcribes it with Whisper and
+sends it to the `assistant` agent of Claude Code (`claude -p --agent
+assistant`) with all its tools: notes, mail, calendar, tasks, Telegram,
+NotebookLM, web search, the browser, files under `~`. While the agent works
+with tools Jarvis says "one second". The short Russian answer is read aloud by
+the same Silero voice at `JARVIS_SPEECH_RATE`. Permissions use Claude Code's
+`auto` mode; changes (mail, messages, tasks, events) happen only after a
+spoken "yes". While Jarvis
+is thinking or speaking the microphone is muted, so its own answer from the
+speakers never becomes the next question. The conversation is remembered until
+"New conversation" in the menu, turning the mode off, or 10 minutes of silence.
+**⌃S** cuts the answer short or cancels the request, **⌃J** again turns the
+mode off. By voice: "включи режим Джарвис" (with Fn) and "выключи режим" /
+"отбой" (in the mode, hands-free).
+
+This is the only part of the app that needs the network and a Claude Code
+login. Speech detection is energy-based with a threshold that follows the room
+noise, so Jarvis will also answer people talking nearby. Conversation settings
+live in `jarvis.py`, the detector in `listen_helper.py`.
 
 ## Configuration
 

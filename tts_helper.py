@@ -14,7 +14,9 @@ torch с моделью не живёт в одном процессе с Whispe
 
 Протокол (строки через stdin/stdout):
 
-  родитель -> хелпер:  SPEAK <id> <json-строка>   прочитать текст вслух
+  родитель -> хелпер:  SPEAK <id> <json>          прочитать текст вслух; json - строка
+                                                  или {"text": ..., "rate": ...}, где rate -
+                                                  темп SSML: x-slow/slow/medium/fast/x-fast
                        STOP                       прервать чтение
   хелпер -> родитель:  READY          модель загружена, можно командовать
                        OK             команда принята
@@ -150,11 +152,11 @@ class Reader:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
-    def speak(self, speak_id: str, text: str) -> None:
+    def speak(self, speak_id: str, text: str, rate: str = "medium") -> None:
         self.stop()
         self._stop = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, args=(speak_id, text, self._stop), daemon=True
+            target=self._run, args=(speak_id, text, rate, self._stop), daemon=True
         )
         self._thread.start()
 
@@ -165,7 +167,17 @@ class Reader:
             thread.join()
         self._thread = None
 
-    def _run(self, speak_id: str, text: str, stop: threading.Event) -> None:
+    def _synth(self, chunk: str, rate: str):
+        if rate == "medium":
+            return self._model.apply_tts(text=chunk, speaker=self._speaker, sample_rate=self._rate)
+        escaped = chunk.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return self._model.apply_tts(
+            ssml_text=f'<speak><prosody rate="{rate}">{escaped}</prosody></speak>',
+            speaker=self._speaker,
+            sample_rate=self._rate,
+        )
+
+    def _run(self, speak_id: str, text: str, rate: str, stop: threading.Event) -> None:
         stream = None
         try:
             block = int(self._rate * BLOCK_SECONDS)
@@ -173,9 +185,7 @@ class Reader:
                 if stop.is_set():
                     break
                 try:
-                    audio = self._model.apply_tts(
-                        text=chunk, speaker=self._speaker, sample_rate=self._rate
-                    )
+                    audio = self._synth(chunk, rate)
                 except Exception as exc:  # noqa: BLE001 - один кусок не валит чтение
                     _send(f"LOG кусок не синтезирован ({type(exc).__name__}): {chunk[:60]!r}")
                     continue
@@ -222,8 +232,10 @@ def main() -> None:
         try:
             if cmd == "SPEAK":
                 speak_id, _, payload = arg.partition(" ")
-                text = json.loads(payload)
-                reader.speak(speak_id, text)
+                data = json.loads(payload)
+                if isinstance(data, str):
+                    data = {"text": data}
+                reader.speak(speak_id, data["text"], data.get("rate") or "medium")
                 _send("OK")
             elif cmd == "STOP":
                 reader.stop()

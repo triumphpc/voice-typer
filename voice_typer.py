@@ -19,6 +19,7 @@ import math
 import os
 import signal
 import queue
+import re
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,11 @@ from ApplicationServices import (
     kAXSelectedTextAttribute,
 )
 from Foundation import NSObject, NSOperationQueue
+
+# Встроенный в лаунчер интерпретатор запускается без argv, поэтому каталог
+# скрипта в sys.path не попадает и соседние модули сами не импортируются.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import jarvis  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Настройки - меняй под себя
@@ -120,6 +126,17 @@ TTS_START_TIMEOUT = 300.0
 # перехват (тип события, флаги модификаторов).
 TTS_DEBUG_KEYS = False
 
+# Режим «Джарвис»: ⌃J включает и выключает. Пока он включён, фраза на Fn не
+# вставляется, а уходит в Claude (Claude Code CLI), и ответ читается голосом.
+# Единственная часть приложения, которой нужна сеть. Настройки разговора -
+# в jarvis.py.
+JARVIS_ENABLED = True
+JARVIS_KEYCODE = 38  # kVK_ANSI_J
+JARVIS_MODIFIERS = Quartz.kCGEventFlagMaskControl
+JARVIS_HOTKEY_LABEL = "⌃J"
+JARVIS_SPEECH_RATE = "fast"  # темп речи Джарвиса: medium / fast / x-fast
+JARVIS_LISTEN_DEBUG = False  # писать в лог уровни микрофона (подбор порогов)
+
 LOG_PATH = Path.home() / "Library" / "Logs" / "VoiceTyper.log"
 
 # Фразы, которые Whisper выдумывает на тишине (наследие субтитров в обучающих
@@ -196,6 +213,7 @@ def _setup_logging() -> None:
 
 IDLE, RECORDING, WORKING, BROKEN = "idle", "recording", "working", "broken"
 SPEAKING = "speaking"
+JARVIS, THINKING = "jarvis", "thinking"  # режим Джарвис: ждёт фразу / ждёт Claude
 
 # Иконка в строке меню: SF Symbol, а не эмодзи. Эмодзи в строке меню рисуется
 # цветным глифом непредсказуемой ширины и плохо читается на тёмном фоне;
@@ -206,12 +224,17 @@ MENUBAR_SYMBOLS = {
     WORKING: ("waveform", "…"),
     BROKEN: ("exclamationmark.triangle", "⚠️"),
     SPEAKING: ("speaker.wave.2", "🔊"),
+    JARVIS: ("sparkles", "✨"),
+    THINKING: ("ellipsis.bubble", "💭"),
 }
 
 _status_item = None
+_jarvis_item = None
 _status_line = None
 _menu_target = None
 _state = IDLE
+_jarvis_on = False
+_jarvis_busy = False  # вопрос у агента: пока он думает, микрофон не открываем
 
 
 def _on_main(fn) -> None:
@@ -239,10 +262,26 @@ def _apply_menubar_icon(state: str) -> None:
         button.setTitle_(fallback)
 
 
+def set_idle() -> None:
+    """«Готов» - с поправкой на режим: в режиме Джарвис другая иконка."""
+    if _jarvis_on:
+        set_status(JARVIS, "Джарвис: зажми Fn и говори")
+    else:
+        set_status(IDLE, "готов")
+
+
 def set_status(state: str, text: str) -> None:
     """Единая точка индикации: строка меню + всплывающая панель."""
     global _state
     _state = state
+
+    # Режим Джарвис слушает без кнопки - но только когда сам молчит и не
+    # думает: иначе собственный ответ из колонок станет следующим вопросом.
+    if _jarvis_on:
+        if state == JARVIS:
+            _listener.unmute()
+        elif state in (SPEAKING, THINKING):
+            _listener.mute()
 
     def apply():
         _apply_menubar_icon(state)
@@ -262,6 +301,13 @@ class MenuTarget(NSObject):
 
     def stopSpeaking_(self, sender):
         _tts_cmd.put("stop")
+
+    def toggleJarvis_(self, sender):
+        _tts_cmd.put("jarvis")
+
+    def newConversation_(self, sender):
+        _conversation.reset()
+        log.info("jarvis: разговор сброшен из меню")
 
     def quitApp_(self, sender):
         log.info("quit from menu")
@@ -303,6 +349,17 @@ def _build_status_item() -> None:
         menu.addItem_(tts_hint)
 
     menu.addItem_(AppKit.NSMenuItem.separatorItem())
+    if TTS_ENABLED and JARVIS_ENABLED:
+        global _jarvis_item
+        _jarvis_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f"Режим Джарвис ({JARVIS_HOTKEY_LABEL})", "toggleJarvis:", ""
+        )
+        menu.addItem_(_jarvis_item)
+        menu.addItem_(
+            AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Новый разговор", "newConversation:", ""
+            )
+        )
     if TTS_ENABLED:
         menu.addItem_(
             AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -709,20 +766,20 @@ def _audio_worker() -> None:
                 audio = np.fromfile(path, dtype=np.int16)
             except Exception as exc:
                 log.error("не смог прочитать записанный звук: %s", exc)
-                set_status(IDLE, "готов")
+                set_idle()
                 continue
             finally:
                 path.unlink(missing_ok=True)
 
             if audio.size == 0:
                 log.info("no audio captured")
-                set_status(IDLE, "готов")
+                set_idle()
                 continue
 
             duration = audio.size / SAMPLE_RATE
             if duration < MIN_RECORDING_SECONDS:
                 log.info("recording too short (%.2fs), skipping", duration)
-                set_status(IDLE, "готов")
+                set_idle()
                 continue
 
             log.info("recorded %.2fs", duration)
@@ -815,17 +872,21 @@ def _transcribe_worker() -> None:
                 log.info("model ready")
             else:
                 set_status(WORKING, "распознаю…")
-                _transcribe_and_paste(mlx_whisper, audio)
+                if _transcribe_and_paste(mlx_whisper, audio):
+                    continue  # фраза ушла Джарвису - индикацией владеет он
         except Exception as exc:
             log.exception("распознавание не удалось: %s", exc)
             set_status(BROKEN, "ошибка распознавания")
             if audio is not None:
                 _notify("Не удалось распознать - подробности в логе")
+            if _jarvis_on:
+                set_idle()  # иначе микрофон Джарвиса так и остался бы заглушённым
         else:
-            set_status(IDLE, "готов")
+            set_idle()
 
 
-def _transcribe_and_paste(mlx_whisper, audio: np.ndarray) -> None:
+def _transcribe_and_paste(mlx_whisper, audio: np.ndarray) -> bool:
+    """True - фраза передана Джарвису, а не вставлена."""
     # Массив передаётся в mlx_whisper напрямую, а не через временный .wav.
     # Путь к файлу он читает через внешний ffmpeg - которого в PATH приложения,
     # запущенного из Finder, нет (там голый /usr/bin:/bin:/usr/sbin:/sbin,
@@ -849,14 +910,62 @@ def _transcribe_and_paste(mlx_whisper, audio: np.ndarray) -> None:
     log.info("transcribed in %.2fs: %r", time.time() - t0, text)
 
     if not text:
-        return
+        return False
 
     # Whisper на тишине/шуме выдаёт заученные фразы из субтитров - отсекаем.
     if text.lower().rstrip(".!… ") in HALLUCINATIONS:
         log.info("looks like a hallucination on silence, skipping")
-        return
+        return False
+
+    command = _voice_command(text)
+    if command is not None:
+        log.info("голосовая команда: %s режим Джарвис", "включить" if command else "выключить")
+        if command != _jarvis_on:
+            _tts_cmd.put("jarvis")
+        elif _jarvis_on:
+            set_idle()  # уже включён - просто слушаем дальше
+        return True
+
+    if _jarvis_on:
+        # Статус ставим здесь, до передачи: иначе распознавание успело бы
+        # на миг показать «готов» между своей работой и работой Джарвиса.
+        global _jarvis_busy
+        _jarvis_busy = True
+        set_status(THINKING, "Джарвис думает…")
+        _jarvis_q.put(text)
+        return True
 
     _paste_text(text)
+    return False
+
+
+# Голосовые команды режима Джарвис. Whisper пишет имя как попало: «Джарвис»,
+# «Жарвис», «Джервис», «Jarvis», «Jervis». Команда - вся фраза целиком
+# (короткая), чтобы «напомни включить режим джарвис завтра» не сработало.
+_JARVIS_NAME = r"(?:д?ж[аеэ]рв\w*|[jdg]{1,2}[ae]rv\w*)"
+_JARVIS_ON = re.compile(
+    rf"^(?:(?:включи|включить|включай|запусти|активируй)\s+(?:режим\s+)?{_JARVIS_NAME}"
+    rf"|{_JARVIS_NAME}\s*,?\s*(?:включись|просыпайся|на\s+связь))$"
+)
+_JARVIS_OFF = re.compile(
+    rf"^(?:(?:выключи|выключить|отключи|отключить|останови)\s+(?:режим\s+)?{_JARVIS_NAME}"
+    rf"|{_JARVIS_NAME}\s*,?\s*(?:выключись|отбой|спасибо\s*,?\s*отбой)"
+    # Имя Whisper коверкает сильнее всего («Первис»), а в самом режиме
+    # «выключи режим <что угодно>» другого смысла не имеет.
+    rf"|(?:выключи|выключить|отключи|отключить)(?:сь)?\s+режим(?:\s+\w+){{0,2}}|отбой)$"
+)
+
+
+def _voice_command(text: str) -> bool | None:
+    """True - включить Джарвис, False - выключить, None - это не команда."""
+    norm = " ".join(re.sub(r"[^\w\s]", " ", text.lower().replace("ё", "е")).split())
+    if _JARVIS_ON.match(norm):
+        return True
+    # Выключать голосом имеет смысл только в самом режиме: при диктовке
+    # «отбой» - это просто слово, которое надо вставить.
+    if _jarvis_on and _JARVIS_OFF.match(norm):
+        return False
+    return None
 
 
 def _paste_text(text: str) -> None:
@@ -913,7 +1022,10 @@ def _fn_event_callback(proxy, event_type, event, refcon):
         )
         if pressed != _fn_down:
             _fn_down = pressed
-            _audio_cmd.put("start" if pressed else "stop")
+            # В режиме Джарвис микрофон слушает сам - Fn не нужен и только
+            # продублировал бы фразу.
+            if not _jarvis_on or not pressed:
+                _audio_cmd.put("start" if pressed else "stop")
 
     return event
 
@@ -962,7 +1074,7 @@ def reinstall_tap() -> None:
 
     if install_tap():
         log.info("event tap re-created")
-        set_status(IDLE, "готов")
+        set_idle()
     else:
         log.error("failed to re-create event tap")
         set_status(BROKEN, "нет доступа к клавиатуре")
@@ -1037,7 +1149,7 @@ def _tap_watchdog() -> None:
 TTS_HELPER_PATH = Path(__file__).resolve().with_name("tts_helper.py")
 C_KEYCODE = 8  # kVK_ANSI_C - для копирования выделения через ⌘C
 
-_tts_cmd: "queue.Queue[str]" = queue.Queue()
+_tts_cmd: "queue.Queue[str | tuple[str, str]]" = queue.Queue()
 
 
 class TTSHelper:
@@ -1096,14 +1208,14 @@ class TTSHelper:
         self._proc, self._replies = proc, replies
         log.info("tts helper started (pid %d, голос %s)", proc.pid, TTS_SPEAKER)
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, rate: str = "medium") -> None:
         self.ensure_running()
         with self._lock:
             self._next_id += 1
             speak_id = self._active_id = self._next_id
         # json.dumps с ensure_ascii: переводы строк и любые символы текста
         # гарантированно уезжают одной строкой протокола.
-        self._send(f"SPEAK {speak_id} {json.dumps(text)}")
+        self._send(f"SPEAK {speak_id} {json.dumps({'text': text, 'rate': rate})}")
         self._wait_ok()
 
     def stop(self) -> None:
@@ -1181,7 +1293,10 @@ def _tts_finished() -> None:
     # Гасим только свою индикацию: если за время чтения пользователь начал
     # диктовать, иконкой уже владеет распознавание.
     if _state == SPEAKING:
-        set_status(IDLE, "готов")
+        if _jarvis_on and _jarvis_busy:  # договорил «секунду», агент ещё работает
+            set_status(THINKING, "Джарвис думает…")
+        else:
+            set_idle()
 
 
 # -- Выделенный текст ---------------------------------------------------------
@@ -1406,6 +1521,21 @@ def _tts_worker() -> None:
     while True:
         cmd = _tts_cmd.get()
         try:
+            if cmd == "jarvis":
+                _toggle_jarvis()
+                continue
+            if isinstance(cmd, tuple):  # ("say", текст) - ответ Джарвиса
+                text = cmd[1].strip()
+                if text:
+                    set_status(SPEAKING, "Джарвис говорит…")
+                    _tts.speak(text, JARVIS_SPEECH_RATE)
+                else:
+                    set_idle()
+                continue
+            if cmd == "toggle" and _jarvis_on and _state == THINKING and not _tts.speaking:
+                _conversation.cancel()  # ⌃S, пока агент думает, - отмена запроса
+                log.info("jarvis: запрос отменён по %s", TTS_HOTKEY_LABEL)
+                continue
             if cmd == "stop" or (cmd == "toggle" and _tts.speaking):
                 _tts.stop()
                 _tts_finished()
@@ -1436,11 +1566,173 @@ def _tts_worker() -> None:
                 log.warning("не смог поднять хелпер озвучки: %s", exc2)
 
 
+# -- Режим Джарвис ---------------------------------------------------------------
+
+_jarvis_q: "queue.Queue[str]" = queue.Queue()
+_conversation = jarvis.Conversation()
+
+LISTEN_HELPER_PATH = Path(__file__).resolve().with_name("listen_helper.py")
+
+
+class ListenHelper:
+    """Клиент listen_helper.py: микрофон без кнопки на время режима Джарвис.
+
+    Хелпер сам режет речь на фразы и присылает их файлами; фраза идёт тем же
+    путём, что и запись по Fn - в Whisper, а оттуда Джарвису. После каждой
+    фразы хелпер глохнет сам и ждёт UNMUTE (его шлёт set_status, когда
+    Джарвис договорил)."""
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        self.stop()
+        out_dir = Path(tempfile.gettempdir()) / "voice-typer-listen"
+        out_dir.mkdir(exist_ok=True)
+        env = dict(os.environ, VT_LISTEN_DEBUG="1" if JARVIS_LISTEN_DEBUG else "0")
+        proc = subprocess.Popen(
+            [sys.executable, str(LISTEN_HELPER_PATH), str(out_dir)],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        with self._lock:
+            self._proc = proc
+        threading.Thread(target=self._reader, args=(proc,), name="listen-reader", daemon=True).start()
+        log.info("listen helper started (pid %d)", proc.pid)
+
+    def stop(self) -> None:
+        with self._lock:
+            proc, self._proc = self._proc, None
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+            log.info("listen helper stopped (pid %d)", proc.pid)
+
+    def mute(self) -> None:
+        self._send("MUTE")
+
+    def unmute(self) -> None:
+        self._send("UNMUTE")
+
+    def _send(self, line: str) -> None:
+        with self._lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                return
+            try:
+                proc.stdin.write(line + "\n")
+                proc.stdin.flush()
+            except OSError:
+                pass
+
+    def _reader(self, proc: subprocess.Popen) -> None:
+        global _level
+        for line in proc.stdout:
+            cmd, _, arg = line.strip().partition(" ")
+            if cmd == "LEVEL":
+                try:
+                    _level = max(float(arg) * 1.6, _level * 0.55)
+                except ValueError:
+                    pass
+            elif cmd == "SPEECH":
+                set_status(RECORDING, "Джарвис слушает…")
+            elif cmd == "DROP":
+                set_idle()
+            elif cmd == "UTT":
+                path, _, dur = arg.rpartition(" ")
+                try:
+                    audio = np.fromfile(path, dtype=np.int16)
+                finally:
+                    Path(path).unlink(missing_ok=True)
+                log.info("jarvis: фраза %ss", dur)
+                set_status(WORKING, "распознаю…")
+                _transcribe_q.put(audio)
+            elif cmd == "READY":
+                log.info("микрофон Джарвиса открыт")
+            elif cmd in ("STAT", "LOG"):
+                log.info("listen: %s", arg)
+            elif cmd == "ERR":
+                log.error("listen helper: %s", arg)
+                _say("Не могу открыть микрофон.")
+        with self._lock:
+            current = self._proc is proc
+        if current and _jarvis_on:
+            log.warning("listen helper умер - режим Джарвис без микрофона")
+            _say("Микрофон отвалился. Выключи и включи режим.")
+
+
+_listener = ListenHelper()
+
+
+def _say(text: str) -> None:
+    _tts_cmd.put(("say", text))
+
+
+def _toggle_jarvis() -> None:
+    """Только из потока _tts_worker: он же озвучивает приветствие."""
+    global _jarvis_on, _jarvis_busy
+    _jarvis_on = not _jarvis_on
+    if _tts.speaking:
+        _tts.stop()
+    _conversation.cancel()
+    _jarvis_busy = False
+    if not _jarvis_on:
+        _conversation.reset()
+    if _jarvis_on:
+        _listener.start()  # стартует заглушённым, слушать начнёт после приветствия
+    else:
+        _listener.stop()
+    log.info("режим Джарвис %s", "включён" if _jarvis_on else "выключен")
+    if _jarvis_item is not None:
+        state = AppKit.NSControlStateValueOn if _jarvis_on else AppKit.NSControlStateValueOff
+        _on_main(lambda: _jarvis_item.setState_(state))
+    set_status(SPEAKING, "Джарвис говорит…")
+    _tts.speak("Слушаю." if _jarvis_on else "До связи.", JARVIS_SPEECH_RATE)
+
+
+def _jarvis_worker() -> None:
+    global _jarvis_busy
+    while True:
+        question = _jarvis_q.get()
+        try:
+            answer = jarvis.speakable(
+                _conversation.ask(question, on_tool=lambda: _say("Секунду."))
+            )
+            if not answer:
+                answer = "Мне нечего ответить."
+        except InterruptedError:
+            log.info("jarvis: запрос отменён")
+            _jarvis_busy = False
+            if not _tts.speaking:
+                set_idle()
+            continue
+        except jarvis.ClaudeError as exc:
+            log.warning("jarvis: %s", exc)
+            answer = str(exc)
+        except Exception as exc:
+            log.exception("jarvis: запрос не удался: %s", exc)
+            answer = "Что-то сломалось, подробности в логе."
+        _jarvis_busy = False
+        if not _jarvis_on:  # режим выключили, пока Claude думал
+            continue
+        _say(answer)
+
+
 # -- Хоткей --------------------------------------------------------------------
 
 _tts_tap = None
 _tts_tap_source = None
 _tts_swallowed_down = False
+
+# Код клавиши -> (модификаторы, команда в очередь _tts_cmd).
+_HOTKEYS = {TTS_KEYCODE: (TTS_MODIFIERS, "toggle")}
+if JARVIS_ENABLED:
+    _HOTKEYS[JARVIS_KEYCODE] = (JARVIS_MODIFIERS, "jarvis")
 
 
 def _tts_event_callback(proxy, event_type, event, refcon):
@@ -1457,8 +1749,11 @@ def _tts_event_callback(proxy, event_type, event, refcon):
         Quartz.CGEventTapEnable(_tts_tap, True)
         return event
 
-    if Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode) != TTS_KEYCODE:
+    keycode = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode)
+    hotkey = _HOTKEYS.get(keycode)
+    if hotkey is None:
         return event
+    modifiers, command = hotkey
 
     if TTS_DEBUG_KEYS:
         log.info(
@@ -1480,12 +1775,12 @@ def _tts_event_callback(proxy, event_type, event, refcon):
         | Quartz.kCGEventFlagMaskShift
         | Quartz.kCGEventFlagMaskCommand
     )
-    if flags != TTS_MODIFIERS:
+    if flags != modifiers:
         return event
 
     _tts_swallowed_down = True
     if not Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat):
-        _tts_cmd.put("toggle")
+        _tts_cmd.put(command)
     return None
 
 
@@ -1549,7 +1844,7 @@ def _tts_tap_watchdog() -> None:
                 else:
                     log.info("защищённый ввод выключен - %s снова ловится", TTS_HOTKEY_LABEL)
                     if _state == IDLE:
-                        set_status(IDLE, "готов")
+                        set_idle()
                 secure_pid = pid
         except Exception as exc:
             log.warning("secure input check failed: %s", exc)
@@ -1669,6 +1964,8 @@ def main() -> None:
         threading.Thread(target=_tts_worker, name="tts", daemon=True).start()
         threading.Thread(target=_clipboard_watcher, name="clipboard", daemon=True).start()
         threading.Thread(target=_tts_tap_watchdog, name="tts-watchdog", daemon=True).start()
+        if JARVIS_ENABLED:
+            threading.Thread(target=_jarvis_worker, name="jarvis", daemon=True).start()
 
     _transcribe_q.put(None)  # прогрев модели
     log.info("running. Hold Fn to talk.")

@@ -20,6 +20,7 @@ import os
 import signal
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,7 @@ from Foundation import NSObject, NSOperationQueue
 # скрипта в sys.path не попадает и соседние модули сами не импортируются.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import jarvis  # noqa: E402
+import speaker_gate  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Настройки - меняй под себя
@@ -136,6 +138,13 @@ JARVIS_MODIFIERS = Quartz.kCGEventFlagMaskControl
 JARVIS_HOTKEY_LABEL = "⌃J"
 JARVIS_SPEECH_RATE = "fast"  # темп речи Джарвиса: medium / fast / x-fast
 JARVIS_LISTEN_DEBUG = False  # писать в лог уровни микрофона (подбор порогов)
+# Слушаться только владельца: фраза без кнопки сверяется с отпечатком голоса
+# (speaker_gate.py, записать - меню «Записать мой голос»). Оценка каждой фразы
+# пишется в лог («jarvis: голос 0.xxx»): порог подбирай по своим оценкам и по
+# чужим (телевизор, другой человек), проверка - enroll_voice.py --test.
+# Нет отпечатка или модели - работает без фильтра. Фразы по Fn не проверяются.
+JARVIS_VOICE_GATE = True
+JARVIS_VOICE_THRESHOLD = 0.5
 
 LOG_PATH = Path.home() / "Library" / "Logs" / "VoiceTyper.log"
 
@@ -309,6 +318,20 @@ class MenuTarget(NSObject):
         _conversation.reset()
         log.info("jarvis: разговор сброшен из меню")
 
+    def enrollVoice_(self, sender):
+        # Во время записи Джарвис должен молчать: иначе фразы уйдут ему, а его
+        # ответы из колонок попадут в отпечаток как «мой голос».
+        if _jarvis_on:
+            _tts_cmd.put("jarvis")
+        # Запись идёт в Терминале: там видно, какую фразу читать, и оценки.
+        script = Path(__file__).resolve().with_name("enroll_voice.py")
+        command = f"cd {shlex.quote(str(script.parent))} && {shlex.quote(sys.executable)} {script.name}"
+        subprocess.Popen([
+            "osascript",
+            "-e", f'tell application "Terminal" to do script "{command}"',
+            "-e", 'tell application "Terminal" to activate',
+        ])
+
     def quitApp_(self, sender):
         log.info("quit from menu")
         AppKit.NSApp().terminate_(None)
@@ -360,6 +383,12 @@ def _build_status_item() -> None:
                 "Новый разговор", "newConversation:", ""
             )
         )
+        if JARVIS_VOICE_GATE:
+            menu.addItem_(
+                AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    "Записать мой голос…", "enrollVoice:", ""
+                )
+            )
     if TTS_ENABLED:
         menu.addItem_(
             AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -1654,6 +1683,9 @@ class ListenHelper:
                 finally:
                     Path(path).unlink(missing_ok=True)
                 log.info("jarvis: фраза %ss", dur)
+                if not _voice_ok(audio):
+                    set_idle()  # как DROP: иначе микрофон остался бы заглушённым
+                    continue
                 set_status(WORKING, "распознаю…")
                 _transcribe_q.put(audio)
             elif cmd == "READY":
@@ -1671,6 +1703,47 @@ class ListenHelper:
 
 
 _listener = ListenHelper()
+_voice_gate = speaker_gate.SpeakerGate()
+_voice_gate_broken = False  # модель не загрузилась при включении режима
+
+
+def _voice_gate_problem() -> str | None:
+    """Почему фильтр голоса не работает (None - работает). Заодно грузит
+    модель, чтобы первая фраза не ждала. Зовётся при включении режима."""
+    global _voice_gate_broken
+    _voice_gate_broken = False
+    if not JARVIS_VOICE_GATE:
+        return None
+    try:
+        _voice_gate.load()
+    except Exception as exc:
+        log.warning("jarvis: модель проверки голоса не загрузилась: %s", exc)
+        _voice_gate_broken = True  # не пытаться скачивать её на каждой фразе
+        return "модель проверки голоса не загрузилась"
+    if not _voice_gate.has_voiceprint():
+        log.warning("jarvis: отпечатка голоса нет (%s)", speaker_gate.VOICEPRINT_PATH)
+        return "голос не записан"
+    return None
+
+
+def _voice_ok(audio: np.ndarray) -> bool:
+    """Фраза без кнопки сказана владельцем? Без отпечатка или модели - да
+    (работаем как раньше: о том, что фильтр выключен, сказано при включении)."""
+    if not JARVIS_VOICE_GATE or _voice_gate_broken:
+        return True
+    try:
+        score = _voice_gate.score(audio)
+    except Exception as exc:
+        log.warning("jarvis: проверка голоса не удалась, пропускаю фразу как есть: %s", exc)
+        return True
+    if score is None:
+        return True
+    ok = score >= JARVIS_VOICE_THRESHOLD
+    log.info(
+        "jarvis: голос %.3f (порог %.2f) - %s",
+        score, JARVIS_VOICE_THRESHOLD, "свой" if ok else "чужой, игнорирую",
+    )
+    return ok
 
 
 def _say(text: str) -> None:
@@ -1695,8 +1768,12 @@ def _toggle_jarvis() -> None:
     if _jarvis_item is not None:
         state = AppKit.NSControlStateValueOn if _jarvis_on else AppKit.NSControlStateValueOff
         _on_main(lambda: _jarvis_item.setState_(state))
+    greeting = "До связи."
+    if _jarvis_on:
+        problem = _voice_gate_problem()
+        greeting = f"Слушаю. Но {problem}, отвечу любому голосу." if problem else "Слушаю."
     set_status(SPEAKING, "Джарвис говорит…")
-    _tts.speak("Слушаю." if _jarvis_on else "До связи.", JARVIS_SPEECH_RATE)
+    _tts.speak(greeting, JARVIS_SPEECH_RATE)
 
 
 def _jarvis_worker() -> None:

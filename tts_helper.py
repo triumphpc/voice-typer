@@ -108,6 +108,8 @@ _SENTENCE_END = re.compile(r"(?<=[.!?…;:])\s+|\n+")
 # Silero отказывается (ValueError) от куска, в котором нет ни одной русской
 # буквы - латиница, цифры и знаки им выбрасываются. Такие куски пропускаем.
 _HAS_CYRILLIC = re.compile(r"[а-яё]", re.IGNORECASE)
+# Что можно отдать в SSML: русские буквы, пробелы и обычная пунктуация.
+_SSML_UNSAFE = re.compile(r"[^а-яёА-ЯЁ\s.,!?…:;\-—–«»()]")
 
 
 def split_text(text: str, limit: int = MAX_CHUNK_CHARS) -> list[str]:
@@ -168,14 +170,25 @@ class Reader:
         self._thread = None
 
     def _synth(self, chunk: str, rate: str):
-        if rate == "medium":
-            return self._model.apply_tts(text=chunk, speaker=self._speaker, sample_rate=self._rate)
-        escaped = chunk.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return self._model.apply_tts(
-            ssml_text=f'<speak><prosody rate="{rate}">{escaped}</prosody></speak>',
-            speaker=self._speaker,
-            sample_rate=self._rate,
+        plain = lambda: self._model.apply_tts(  # noqa: E731
+            text=chunk, speaker=self._speaker, sample_rate=self._rate
         )
+        if rate == "medium":
+            return plain()
+        # SSML-разбор Silero падает на латинице и прочих символах, которые в
+        # обычном режиме модель просто пропускает. Пропускаем их сами.
+        clean = " ".join(_SSML_UNSAFE.sub(" ", chunk).split())
+        if not _HAS_CYRILLIC.search(clean):
+            return plain()
+        try:
+            return self._model.apply_tts(
+                ssml_text=f'<speak><prosody rate="{rate}">{clean}</prosody></speak>',
+                speaker=self._speaker,
+                sample_rate=self._rate,
+            )
+        except Exception as exc:  # noqa: BLE001 - лучше обычный темп, чем тишина
+            _send(f"LOG SSML не разобран ({exc}), читаю в обычном темпе: {chunk[:60]!r}")
+            return plain()
 
     def _run(self, speak_id: str, text: str, rate: str, stop: threading.Event) -> None:
         stream = None

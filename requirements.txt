@@ -2,3 +2,5 @@ mlx-whisper
 sounddevice
 numpy
 pyobjc-framework-Quartz
+# Silero TTS (read-aloud). Already pulled in by mlx-whisper, listed explicitly.
+torch

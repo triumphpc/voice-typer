@@ -29,6 +29,8 @@ No cloud, no subscriptions, no telemetry. Audio and text never leave your Mac.
 - 🛡 **Self-healing** — watchdogs recover from macOS disabling the event tap,
   audio-device changes, sleep/wake, and wedged CoreAudio calls
 - 🌍 **Any Whisper language** — defaults to Russian, one line to change
+- 🔊 **Read selection aloud** — select text anywhere, press **⌃S**, and a
+  local Silero voice reads it; press again to stop
 
 ## How it works
 
@@ -82,7 +84,7 @@ Privacy & Security**, grant:
 |---|---|
 | **Microphone** | record your voice |
 | **Input Monitoring** | detect the Fn key globally |
-| **Accessibility** | paste text via Cmd+V |
+| **Accessibility** | paste text via Cmd+V, read the selection on ⌃S |
 
 Permissions are granted to the **app bundle**, not to Python — anything you
 previously granted to your terminal does not carry over. This is also why the
@@ -106,6 +108,28 @@ recording, waveform — transcribing, warning triangle — missing permissions.
 
 If pasting fails, the text is still on the clipboard — press Cmd+V manually.
 
+### Reading text aloud
+
+Select text in any app and press **⌃S** — it is read aloud by a local
+Silero voice (Russian, `aidar` by default). Press **⌃S** again, or use
+"Stop reading" in the menu, to stop. The menu bar icon shows a speaker while
+reading. Dictation on Fn works independently.
+
+The selection is taken through the Accessibility API, which leaves the
+clipboard alone. Apps that don't expose it (Electron, some browsers) fall
+back to a simulated ⌘C, after which the previous clipboard contents are
+restored. If the app ignores synthetic ⌘C too (Warp does), the app's own
+Edit → Copy menu item is pressed through Accessibility. The last resort is
+copy-on-select terminals: whatever the app itself put on the clipboard in
+the last 15 s.
+
+While some app holds Secure Event Input (a password field, `sudo`, the lock
+screen), macOS hides key presses from every event tap, so ⌃S is not seen;
+the menu status says so. Fn keeps working.
+
+The Silero model (`v5_6_ru`, ~150 MB) is downloaded once on first launch to
+`~/.cache/voice-typer/`; after that no network is used.
+
 ## Configuration
 
 All settings are constants at the top of [`voice_typer.py`](voice_typer.py):
@@ -120,6 +144,11 @@ All settings are constants at the top of [`voice_typer.py`](voice_typer.py):
 | `SOUND_FEEDBACK` | `False` | start/stop sounds (off — the HUD replaces them) |
 | `SHOW_IN_DOCK` | `False` | show a Dock icon and appear in ⌘-Tab |
 | `HALLUCINATIONS` | — | phrases Whisper invents on silence, filtered out |
+| `TTS_ENABLED` | `True` | reading the selection aloud on ⌃S |
+| `TTS_SPEAKER` | `"aidar"` | Silero voice: `aidar`, `eugene` (male), `baya`, `kseniya`, `xenia` (female) |
+| `TTS_SAMPLE_RATE` | `48000` | synthesis sample rate: `8000` / `24000` / `48000` |
+| `TTS_KEYCODE` / `TTS_MODIFIERS` | S / ⌃ | the read-aloud hotkey (physical key code, layout-independent) |
+| `TTS_MAX_CHARS` | `20000` | longer selections are truncated |
 
 ## Troubleshooting
 
@@ -191,6 +220,8 @@ always reflects the real state.
 - Pasting goes through the clipboard, overwriting its previous contents
 - On very quiet or short recordings Whisper occasionally hallucinates text —
   common cases are filtered, the rest is one Cmd+Z away
+- Read-aloud is Russian only: Silero's Russian model skips Latin words and
+  digits (write numbers out as words to hear them)
 
 ## License
 

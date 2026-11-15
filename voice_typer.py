@@ -14,6 +14,7 @@ import collections
 import logging
 import logging.handlers
 import fcntl
+import json
 import math
 import os
 import signal
@@ -31,6 +32,16 @@ import AppKit
 import Foundation
 import Quartz
 from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
+from ApplicationServices import (
+    AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication,
+    AXUIElementPerformAction,
+    AXUIElementSetAttributeValue,
+    AXUIElementSetMessagingTimeout,
+    kAXErrorSuccess,
+    kAXFocusedUIElementAttribute,
+    kAXSelectedTextAttribute,
+)
 from Foundation import NSObject, NSOperationQueue
 
 # ---------------------------------------------------------------------------
@@ -84,6 +95,30 @@ SHOW_IN_DOCK = False
 
 # Физический код клавиши V (kVK_ANSI_V). Не зависит от раскладки клавиатуры.
 V_KEYCODE = 9
+
+# --- Озвучка выделенного текста (TTS) ---------------------------------------
+# Выделил текст, нажал ⌃S - он читается вслух. Повторное нажатие во время
+# чтения останавливает его. Синтез локальный: Silero, на CPU, без сети.
+TTS_ENABLED = True
+# Голоса: aidar, eugene (мужские), baya, kseniya, xenia (женские).
+TTS_SPEAKER = "aidar"
+TTS_SAMPLE_RATE = 48000  # 8000 / 24000 / 48000
+TTS_MODEL_URL = "https://models.silero.ai/models/tts/ru/v5_6_ru.pt"
+# Скачивается один раз (~150 МБ) при первом запуске, дальше сеть не нужна.
+TTS_MODEL_PATH = Path.home() / ".cache" / "voice-typer" / "v5_6_ru.pt"
+# Хоткей: физический код клавиши (kVK_ANSI_S = 1, от раскладки не зависит)
+# и обязательные модификаторы. Лишние модификаторы (⌘, ⇧) - не наш хоткей.
+TTS_KEYCODE = 1
+TTS_MODIFIERS = Quartz.kCGEventFlagMaskControl
+TTS_HOTKEY_LABEL = "⌃S"
+# Предохранитель от случайного ⌘A на огромном документе.
+TTS_MAX_CHARS = 20000
+# Старт хелпера озвучки: импорт torch + загрузка модели, а в первый раз ещё
+# и скачивание - поэтому таймаут куда щедрее, чем у аудио-хелпера.
+TTS_START_TIMEOUT = 300.0
+# Диагностика: писать в лог каждое нажатие клавиши хоткея, которое видит
+# перехват (тип события, флаги модификаторов).
+TTS_DEBUG_KEYS = False
 
 LOG_PATH = Path.home() / "Library" / "Logs" / "VoiceTyper.log"
 
@@ -160,6 +195,7 @@ def _setup_logging() -> None:
 # ---------------------------------------------------------------------------
 
 IDLE, RECORDING, WORKING, BROKEN = "idle", "recording", "working", "broken"
+SPEAKING = "speaking"
 
 # Иконка в строке меню: SF Symbol, а не эмодзи. Эмодзи в строке меню рисуется
 # цветным глифом непредсказуемой ширины и плохо читается на тёмном фоне;
@@ -169,6 +205,7 @@ MENUBAR_SYMBOLS = {
     RECORDING: ("mic.fill", "🔴"),
     WORKING: ("waveform", "…"),
     BROKEN: ("exclamationmark.triangle", "⚠️"),
+    SPEAKING: ("speaker.wave.2", "🔊"),
 }
 
 _status_item = None
@@ -223,6 +260,9 @@ class MenuTarget(NSObject):
     def restartTap_(self, sender):
         threading.Thread(target=reinstall_tap, name="menu-restart", daemon=True).start()
 
+    def stopSpeaking_(self, sender):
+        _tts_cmd.put("stop")
+
     def quitApp_(self, sender):
         log.info("quit from menu")
         AppKit.NSApp().terminate_(None)
@@ -255,7 +295,20 @@ def _build_status_item() -> None:
     hint.setEnabled_(False)
     menu.addItem_(hint)
 
+    if TTS_ENABLED:
+        tts_hint = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            f"Выдели текст, нажми {TTS_HOTKEY_LABEL} - прочитаю вслух", None, ""
+        )
+        tts_hint.setEnabled_(False)
+        menu.addItem_(tts_hint)
+
     menu.addItem_(AppKit.NSMenuItem.separatorItem())
+    if TTS_ENABLED:
+        menu.addItem_(
+            AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Остановить чтение", "stopSpeaking:", ""
+            )
+        )
     menu.addItem_(
         AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Показать лог", "openLog:", ""
@@ -970,6 +1023,553 @@ def _tap_watchdog() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Озвучка выделенного текста (TTS)
+#
+# Выделил текст, нажал ⌃S - текст читается вслух голосом Silero. Повторное
+# нажатие во время чтения останавливает его. Распознавание по Fn этот блок не
+# трогает: свой перехват клавиш, свой поток, свой процесс-хелпер.
+#
+# Синтез и воспроизведение живут в отдельном процессе (tts_helper.py) - по той
+# же причине, что и запись: зависший в CoreAudio вывод звука лечится только
+# убийством процесса. Протокол описан в tts_helper.py.
+# ---------------------------------------------------------------------------
+
+TTS_HELPER_PATH = Path(__file__).resolve().with_name("tts_helper.py")
+C_KEYCODE = 8  # kVK_ANSI_C - для копирования выделения через ⌘C
+
+_tts_cmd: "queue.Queue[str]" = queue.Queue()
+
+
+class TTSHelper:
+    """Клиент процесса озвучки: спавн, команды с таймаутом, kill при клине.
+
+    Команды шлёт только поток _tts_worker. Читающий поток разбирает ответы:
+    OK/ERR - в очередь ответов, DONE <id> - конец чтения (асинхронно),
+    LOG - в лог. Номер чтения нужен, чтобы DONE от прерванного чтения не
+    погасил индикацию следующего.
+    """
+
+    def __init__(self) -> None:
+        self._proc: subprocess.Popen | None = None
+        self._replies: "queue.Queue[str]" = queue.Queue()
+        self._lock = threading.Lock()
+        self._next_id = 0
+        self._active_id: int | None = None
+
+    @property
+    def speaking(self) -> bool:
+        with self._lock:
+            return self._active_id is not None
+
+    def ensure_running(self) -> None:
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        replies: "queue.Queue[str]" = queue.Queue()
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(TTS_HELPER_PATH),
+                str(TTS_MODEL_PATH),
+                TTS_MODEL_URL,
+                TTS_SPEAKER,
+                str(TTS_SAMPLE_RATE),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        threading.Thread(
+            target=self._reader, args=(proc, replies), name="tts-reader", daemon=True
+        ).start()
+        if not TTS_MODEL_PATH.is_file():
+            log.info("модели озвучки нет - скачиваю %s (нужна сеть)", TTS_MODEL_URL)
+        try:
+            reply = replies.get(timeout=TTS_START_TIMEOUT)
+        except queue.Empty:
+            proc.kill()
+            raise TimeoutError(f"хелпер озвучки молчит на старте (> {TTS_START_TIMEOUT:.0f}s)")
+        if reply != "READY":
+            proc.kill()
+            raise RuntimeError(reply.partition(" ")[2] or f"хелпер озвучки не поднялся: {reply!r}")
+        self._proc, self._replies = proc, replies
+        log.info("tts helper started (pid %d, голос %s)", proc.pid, TTS_SPEAKER)
+
+    def speak(self, text: str) -> None:
+        self.ensure_running()
+        with self._lock:
+            self._next_id += 1
+            speak_id = self._active_id = self._next_id
+        # json.dumps с ensure_ascii: переводы строк и любые символы текста
+        # гарантированно уезжают одной строкой протокола.
+        self._send(f"SPEAK {speak_id} {json.dumps(text)}")
+        self._wait_ok()
+
+    def stop(self) -> None:
+        with self._lock:
+            self._active_id = None
+        if self._proc is None or self._proc.poll() is not None:
+            return
+        self._send("STOP")
+        self._wait_ok()
+
+    def kill(self) -> None:
+        proc, self._proc = self._proc, None
+        with self._lock:
+            self._active_id = None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+            log.info("tts helper killed (pid %d)", proc.pid)
+        except Exception as exc:
+            log.warning("не смог убить хелпер озвучки: %s", exc)
+
+    # -- внутренности -------------------------------------------------------
+
+    def _send(self, line: str) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            raise RuntimeError("хелпер озвучки не запущен")
+        proc.stdin.write(line + "\n")
+        proc.stdin.flush()
+
+    def _wait_ok(self) -> None:
+        try:
+            reply = self._replies.get(timeout=HELPER_OP_TIMEOUT)
+        except queue.Empty:
+            raise TimeoutError(f"хелпер озвучки молчит (> {HELPER_OP_TIMEOUT:.0f}s)")
+        if reply != "OK":
+            raise RuntimeError(reply.partition(" ")[2] or reply)
+
+    def _reader(self, proc: subprocess.Popen, replies: "queue.Queue[str]") -> None:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if line.startswith("DONE "):
+                try:
+                    done_id = int(line[5:])
+                except ValueError:
+                    continue
+                with self._lock:
+                    finished = self._active_id == done_id
+                    if finished:
+                        self._active_id = None
+                if finished:
+                    log.info("чтение закончено")
+                    _tts_finished()
+            elif line.startswith("LOG "):
+                log.info("tts: %s", line[4:])
+            else:
+                replies.put(line)
+        # EOF: хелпер умер. Если он что-то читал - индикацию надо погасить.
+        replies.put("ERR хелпер озвучки завершился")
+        with self._lock:
+            was_speaking = self._active_id is not None and self._proc is proc
+            if was_speaking:
+                self._active_id = None
+        if was_speaking:
+            log.warning("хелпер озвучки умер посреди чтения")
+            _tts_finished()
+
+
+_tts = TTSHelper()
+
+
+def _tts_finished() -> None:
+    # Гасим только свою индикацию: если за время чтения пользователь начал
+    # диктовать, иконкой уже владеет распознавание.
+    if _state == SPEAKING:
+        set_status(IDLE, "готов")
+
+
+# -- Выделенный текст ---------------------------------------------------------
+
+
+def _frontmost_app() -> tuple[int, str]:
+    app = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    if app is None:
+        return 0, "?"
+    return int(app.processIdentifier()), str(app.localizedName() or app.bundleIdentifier() or "?")
+
+
+def _selected_text_ax(pid: int) -> str:
+    """Выделение через Accessibility API: буфер обмена не трогается.
+
+    Работает в нативных приложениях (Safari, Заметки, Почта, Pages...).
+    Electron-приложения (VS Code, Slack, Obsidian...) отдают дерево
+    доступности только после AXManualAccessibility = true - выставляем его
+    (для остальных приложений это просто ошибка, вреда нет). Кто не отдал
+    выделение и так - пустая строка и запасной путь через ⌘C.
+    """
+    app = AXUIElementCreateApplication(pid)
+    # Без таймаута подвисшее приложение задержало бы ответ на секунды.
+    AXUIElementSetMessagingTimeout(app, 0.5)
+    AXUIElementSetAttributeValue(app, "AXManualAccessibility", True)
+    err, focused = AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute, None)
+    if err != kAXErrorSuccess or focused is None:
+        log.info("AX: нет сфокусированного элемента (код %s)", err)
+        return ""
+    err, text = AXUIElementCopyAttributeValue(focused, kAXSelectedTextAttribute, None)
+    if err != kAXErrorSuccess:
+        log.info("AX: выделение не отдаётся (код %s)", err)
+        return ""
+    return str(text or "")
+
+
+def _wait_modifiers_released(timeout: float = 1.0) -> None:
+    """Ждём, пока отпустят ⌃ хоткея: некоторые приложения смотрят не на флаги
+    события, а на реально зажатые клавиши, и наш ⌘C превратился бы в ⌃⌘C."""
+    deadline = time.time() + timeout
+    mask = (
+        Quartz.kCGEventFlagMaskControl
+        | Quartz.kCGEventFlagMaskAlternate
+        | Quartz.kCGEventFlagMaskShift
+        | Quartz.kCGEventFlagMaskCommand
+    )
+    while time.time() < deadline:
+        flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
+        if not flags & mask:
+            return
+        time.sleep(0.02)
+
+
+def _post_cmd_c() -> None:
+    _wait_modifiers_released()
+    # Собственный (private) источник событий: его флаги не смешиваются с
+    # состоянием физической клавиатуры, ⌘C уходит ровно как ⌘C.
+    source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStatePrivate)
+    for is_down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(source, C_KEYCODE, is_down)
+        Quartz.CGEventSetFlags(event, Quartz.kCGEventFlagMaskCommand)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        time.sleep(0.01)
+
+
+def _find_copy_menu_item(element, depth: int = 0):
+    """Пункт меню с хоткеем ⌘C (по хоткею, а не по названию - оно локализовано)."""
+    err, kids = AXUIElementCopyAttributeValue(element, "AXChildren", None)
+    if err != kAXErrorSuccess or not kids:
+        return None
+    for kid in kids:
+        _, char = AXUIElementCopyAttributeValue(kid, "AXMenuItemCmdChar", None)
+        _, mods = AXUIElementCopyAttributeValue(kid, "AXMenuItemCmdModifiers", None)
+        if char and str(char).upper() == "C" and mods == 0:
+            return kid
+        if depth < 2:
+            found = _find_copy_menu_item(kid, depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _press_copy_menu(pid: int) -> None:
+    """Пункт «Копировать» в меню приложения, через Accessibility. Срабатывает
+    там, где синтетический ⌘C игнорируется (Warp), - меню приложения доступно
+    через AX, даже когда содержимое окна - нет."""
+    app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, 0.5)
+    err, bar = AXUIElementCopyAttributeValue(app, "AXMenuBar", None)
+    if err != kAXErrorSuccess or bar is None:
+        log.info("меню приложения недоступно (код %s)", err)
+        return
+    item = _find_copy_menu_item(bar)
+    if item is None:
+        log.info("в меню приложения нет пункта с ⌘C")
+        return
+    err = AXUIElementPerformAction(item, "AXPress")
+    if err != kAXErrorSuccess:
+        log.info("пункт меню ⌘C не нажался (код %s)", err)
+
+
+def _selected_text_copy(trigger=_post_cmd_c) -> str:
+    """Запасной путь: копирование (⌘C или пункт меню), чтение буфера и
+    возврат прежнего содержимого."""
+    pb = AppKit.NSPasteboard.generalPasteboard()
+
+    saved = []
+    for item in pb.pasteboardItems() or []:
+        data = {}
+        for kind in item.types():
+            value = item.dataForType_(kind)
+            if value is not None:
+                data[kind] = value
+        saved.append(data)
+    before = pb.changeCount()
+
+    trigger()
+
+    # Приложение копирует асинхронно - ждём смены буфера, но недолго:
+    # если ничего не выделено, буфер не изменится вовсе.
+    deadline = time.time() + 1.0
+    while pb.changeCount() == before and time.time() < deadline:
+        time.sleep(0.02)
+    if pb.changeCount() == before:
+        return ""
+
+    text = pb.stringForType_(AppKit.NSPasteboardTypeString) or ""
+
+    pb.clearContents()
+    items = []
+    for data in saved:
+        item = AppKit.NSPasteboardItem.alloc().init()
+        for kind, value in data.items():
+            item.setData_forType_(value, kind)
+        items.append(item)
+    if items:
+        pb.writeObjects_(items)
+    return str(text)
+
+
+def _get_selected_text() -> str:
+    pid, name = _frontmost_app()
+    text = ""
+    try:
+        text = _selected_text_ax(pid)
+    except Exception as exc:
+        log.info("AX не отдал выделение: %s", exc)
+    if text.strip():
+        log.info("выделение через AX в «%s»: %d символов", name, len(text))
+        return text
+    text = _selected_text_copy()
+    log.info("выделение через ⌘C в «%s»: %d символов", name, len(text))
+    if text.strip():
+        return text
+    try:
+        text = _selected_text_copy(lambda: _press_copy_menu(pid))
+    except Exception as exc:
+        log.info("копирование через меню не удалось: %s", exc)
+        text = ""
+    log.info("выделение через меню «Копировать» в «%s»: %d символов", name, len(text))
+    if text.strip():
+        return text
+    return _selected_text_recent_clipboard(pid, name)
+
+
+# -- Копирование при выделении ------------------------------------------------
+#
+# Терминалы вроде Warp не отдают выделение ни через Accessibility (своя
+# отрисовка, AXSelectedText не поддерживается), ни на программный ⌘C. Зато они
+# копируют выделенное в буфер сами, в момент выделения ("copy on select").
+# Поэтому следим за буфером: когда и при каком активном приложении он менялся
+# в последний раз. Если ⌘C ничего не дал, а буфер только что поменялся в том
+# же приложении - это и есть выделение.
+
+CLIPBOARD_POLL_INTERVAL = 0.25
+CLIPBOARD_RECENT_SECONDS = 15.0
+
+_clip_change = (0, 0.0, 0)  # (changeCount, время смены, pid активного приложения)
+
+
+def _clipboard_watcher() -> None:
+    global _clip_change
+    pb = AppKit.NSPasteboard.generalPasteboard()
+    last = pb.changeCount()
+    while True:
+        time.sleep(CLIPBOARD_POLL_INTERVAL)
+        try:
+            count = pb.changeCount()
+            if count != last:
+                last = count
+                _clip_change = (count, time.time(), _frontmost_app()[0])
+        except Exception as exc:
+            log.warning("clipboard watcher: %s", exc)
+
+
+def _selected_text_recent_clipboard(pid: int, name: str) -> str:
+    count, changed_at, changed_pid = _clip_change
+    pb = AppKit.NSPasteboard.generalPasteboard()
+    age = time.time() - changed_at
+    if count != pb.changeCount() or changed_pid != pid or age > CLIPBOARD_RECENT_SECONDS:
+        log.info(
+            "в буфере нет свежего выделения из «%s» (смена %.0fs назад, pid %s vs %s)",
+            name, age, changed_pid, pid,
+        )
+        return ""
+    text = str(pb.stringForType_(AppKit.NSPasteboardTypeString) or "")
+    log.info("выделение из буфера (скопировано при выделении %.1fs назад): %d символов", age, len(text))
+    return text
+
+
+# -- Рабочий поток --------------------------------------------------------------
+
+
+def _tts_worker() -> None:
+    # Тёплый старт: torch и модель грузятся заранее (несколько секунд), а не
+    # на первом нажатии хоткея.
+    try:
+        _tts.ensure_running()
+    except Exception as exc:
+        log.warning("хелпер озвучки не поднялся на старте: %s", exc)
+
+    while True:
+        cmd = _tts_cmd.get()
+        try:
+            if cmd == "stop" or (cmd == "toggle" and _tts.speaking):
+                _tts.stop()
+                _tts_finished()
+                log.info("чтение остановлено")
+                continue
+
+            text = _get_selected_text().strip()
+            if not text:
+                _notify("Нечего читать - выдели текст")
+                continue
+            if len(text) > TTS_MAX_CHARS:
+                log.info("текст длинный (%d), читаю первые %d символов", len(text), TTS_MAX_CHARS)
+                text = text[:TTS_MAX_CHARS]
+
+            set_status(SPEAKING, "читаю вслух…")
+            _tts.speak(text)
+            log.info("читаю вслух: %d символов", len(text))
+        except Exception as exc:
+            log.exception("озвучка не удалась: %s - перезапускаю хелпер", exc)
+            _tts.kill()
+            _tts_finished()
+            _notify("Не удалось прочитать - подробности в логе")
+            # Поднимаем заново сразу, а не на следующем нажатии: иначе к нему
+            # добавилась бы загрузка модели. Нажатия тем временем ждут в очереди.
+            try:
+                _tts.ensure_running()
+            except Exception as exc2:
+                log.warning("не смог поднять хелпер озвучки: %s", exc2)
+
+
+# -- Хоткей --------------------------------------------------------------------
+
+_tts_tap = None
+_tts_tap_source = None
+_tts_swallowed_down = False
+
+
+def _tts_event_callback(proxy, event_type, event, refcon):
+    """Ловит ⌃S и съедает его, чтобы сочетание не ушло в активное
+    приложение. Как и обработчик Fn - только классифицирует событие и кладёт
+    команду в очередь: медленный обработчик macOS отключает."""
+    global _tts_swallowed_down
+
+    if event_type in (
+        Quartz.kCGEventTapDisabledByTimeout,
+        Quartz.kCGEventTapDisabledByUserInput,
+    ):
+        log.warning("tts event tap disabled by the system, re-enabling")
+        Quartz.CGEventTapEnable(_tts_tap, True)
+        return event
+
+    if Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventKeycode) != TTS_KEYCODE:
+        return event
+
+    if TTS_DEBUG_KEYS:
+        log.info(
+            "tts key: type=%s flags=%#x autorepeat=%s",
+            event_type,
+            Quartz.CGEventGetFlags(event),
+            Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat),
+        )
+
+    if event_type == Quartz.kCGEventKeyUp:
+        if _tts_swallowed_down:
+            _tts_swallowed_down = False
+            return None
+        return event
+
+    flags = Quartz.CGEventGetFlags(event) & (
+        Quartz.kCGEventFlagMaskControl
+        | Quartz.kCGEventFlagMaskAlternate
+        | Quartz.kCGEventFlagMaskShift
+        | Quartz.kCGEventFlagMaskCommand
+    )
+    if flags != TTS_MODIFIERS:
+        return event
+
+    _tts_swallowed_down = True
+    if not Quartz.CGEventGetIntegerValueField(event, Quartz.kCGKeyboardEventAutorepeat):
+        _tts_cmd.put("toggle")
+    return None
+
+
+def install_tts_tap() -> bool:
+    """Отдельный от Fn перехват: активный (может съесть событие), только
+    нажатия клавиш. Активному перехвату нужно право «Универсальный доступ» -
+    оно и так нужно приложению для вставки текста."""
+    global _tts_tap, _tts_tap_source
+
+    tap = Quartz.CGEventTapCreate(
+        Quartz.kCGSessionEventTap,
+        Quartz.kCGHeadInsertEventTap,
+        Quartz.kCGEventTapOptionDefault,
+        Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown) | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp),
+        _tts_event_callback,
+        None,
+    )
+    if tap is None:
+        return False
+
+    source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+    Quartz.CFRunLoopAddSource(Quartz.CFRunLoopGetMain(), source, Quartz.kCFRunLoopCommonModes)
+    Quartz.CGEventTapEnable(tap, True)
+    _tts_tap, _tts_tap_source = tap, source
+    return True
+
+
+def _secure_input_owner() -> int:
+    """PID приложения, включившего защищённый ввод (Secure Event Input), или 0.
+
+    Пока он включён, macOS не показывает перехватчикам нажатия клавиш - ⌃S
+    до нас не доходит вовсе. Изменения модификаторов при этом видны, поэтому
+    Fn продолжает работать. Включают его поля паролей (браузер, менеджер
+    паролей) и терминалы, когда видят запрос пароля (sudo, ssh).
+    """
+    info = Quartz.CGSessionCopyCurrentDictionary() or {}
+    return int(info.get("kCGSSessionSecureInputPID", 0) or 0)
+
+
+def _app_name(pid: int) -> str:
+    app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    return str(app.localizedName()) if app is not None else f"pid {pid}"
+
+
+def _tts_tap_watchdog() -> None:
+    """Сторож перехвата ⌃S - по той же логике, что и сторож Fn: macOS
+    отключает перехват молча, состояние надо опрашивать. Пока нет права
+    «Универсальный доступ», перехват не создаётся вовсе - пробуем снова.
+    Заодно следит за защищённым вводом: при нём ⌃S не ловится в принципе."""
+    warned = False
+    secure_pid = 0
+    while True:
+        time.sleep(TAP_CHECK_INTERVAL)
+        try:
+            pid = _secure_input_owner()
+            if pid != secure_pid:
+                if pid:
+                    log.warning("защищённый ввод включил «%s» - %s не ловится", _app_name(pid), TTS_HOTKEY_LABEL)
+                    if _state == IDLE:
+                        set_status(IDLE, f"{TTS_HOTKEY_LABEL} не работает: защищённый ввод в «{_app_name(pid)}»")
+                else:
+                    log.info("защищённый ввод выключен - %s снова ловится", TTS_HOTKEY_LABEL)
+                    if _state == IDLE:
+                        set_status(IDLE, "готов")
+                secure_pid = pid
+        except Exception as exc:
+            log.warning("secure input check failed: %s", exc)
+        try:
+            if _tts_tap is None:
+                if install_tts_tap():
+                    log.info("перехват %s установлен", TTS_HOTKEY_LABEL)
+                    warned = False
+                elif not warned:
+                    log.error("перехват %s не создаётся - нужен «Универсальный доступ»", TTS_HOTKEY_LABEL)
+                    warned = True
+                continue
+            if not Quartz.CGEventTapIsEnabled(_tts_tap):
+                log.warning("перехват %s выключен, включаю", TTS_HOTKEY_LABEL)
+                Quartz.CGEventTapEnable(_tts_tap, True)
+        except Exception as exc:
+            log.warning("tts tap check failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Права доступа
 # ---------------------------------------------------------------------------
 
@@ -1056,6 +1656,19 @@ def main() -> None:
     threading.Thread(target=_audio_worker, name="audio", daemon=True).start()
     threading.Thread(target=_transcribe_worker, name="whisper", daemon=True).start()
     threading.Thread(target=_tap_watchdog, name="watchdog", daemon=True).start()
+
+    if TTS_ENABLED:
+        # pyobjc подгружает функции Quartz лениво, и первое обращение к одной
+        # и той же функции из двух потоков сразу падает (KeyError). Сторожа Fn
+        # и ⌃S просыпаются одновременно - поэтому резолвим её заранее, здесь.
+        Quartz.CGEventTapIsEnabled  # noqa: B018
+        if install_tts_tap():
+            log.info("перехват %s установлен", TTS_HOTKEY_LABEL)
+        else:
+            log.error("перехват %s не создан - нужен «Универсальный доступ»", TTS_HOTKEY_LABEL)
+        threading.Thread(target=_tts_worker, name="tts", daemon=True).start()
+        threading.Thread(target=_clipboard_watcher, name="clipboard", daemon=True).start()
+        threading.Thread(target=_tts_tap_watchdog, name="tts-watchdog", daemon=True).start()
 
     _transcribe_q.put(None)  # прогрев модели
     log.info("running. Hold Fn to talk.")

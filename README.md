@@ -246,8 +246,10 @@ always reflects the real state.
 - Pasting goes through the clipboard, overwriting its previous contents
 - On very quiet or short recordings Whisper occasionally hallucinates text —
   common cases are filtered, the rest is one Cmd+Z away
-- Read-aloud is Russian only: Silero's Russian model skips Latin words and
-  digits (write numbers out as words to hear them)
+- Read-aloud (⌃S) is Russian only: Silero's Russian model skips Latin words
+  and digits (write numbers out as words to hear them). Jarvis answers are
+  transliterated instead — Latin in Cyrillic letters, acronyms letter by
+  letter, digits as words — rough, but audible
 
 ## License
 

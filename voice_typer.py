@@ -926,6 +926,10 @@ def _transcribe_and_paste(mlx_whisper, audio: np.ndarray) -> bool:
             set_idle()  # уже включён - просто слушаем дальше
         return True
 
+    if _jarvis_on and jarvis.looks_looped(text):
+        log.info("jarvis: распознавание зациклилось - фразу не отправляю")
+        return False
+
     if _jarvis_on:
         # Статус ставим здесь, до передачи: иначе распознавание успело бы
         # на миг показать «готов» между своей работой и работой Джарвиса.
